@@ -1,20 +1,20 @@
 # file: bot.py
-# Python 3.11+ | python-telegram-bot v20 | telethon | sqlite3
-# Render + GitHub deploy ready
-# env vars: BOT_TOKEN, ADMIN_ID, API_ID, API_HASH, UPI_ID, QR_IMAGE (optional)
+# shopbot — Telegram account seller bot
+# features: manual QR payment, admin accept/reject/block,
+#           one-account-per-user, history, OTP relay (5 min wait),
+#           3-day session expiry auto-logout, stock-out detection
+# deps: python-telegram-bot==20.7, telethon==1.36.0, qrcode[pil]
+# run: python bot.py
+# deploy: Render Worker + Persistent Disk (/var/data)
 
 import os, re, asyncio, sqlite3, logging
-from datetime import datetime, timedelta
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID  = int(os.getenv("ADMIN_ID", "0"))
 API_ID    = int(os.getenv("API_ID", "0"))
@@ -22,18 +22,17 @@ API_HASH  = os.getenv("API_HASH", "")
 UPI_ID    = os.getenv("UPI_ID", "yourupi@fam")
 QR_IMAGE  = os.getenv("QR_IMAGE", "qr.png")
 DB_PATH   = os.getenv("DB_PATH", "shop.db")
-WAIT_SECONDS = 300  # 5 min
+WAIT_SECONDS = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("shopbot")
 
 OTP_RE = re.compile(r"(?:Login code|code|OTP)[:\s]+(\d{4,6})", re.IGNORECASE)
 
-def extract_otp(text: str):
+def extract_otp(text):
     m = OTP_RE.search(text or "")
     return m.group(1) if m else None
 
-# ---------- DB ----------
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
@@ -76,10 +75,6 @@ def is_blocked(uid):
 def shop_status():
     c = db(); r = c.execute("SELECT value FROM settings WHERE key='shop_status'").fetchone()
     c.close(); return (r["value"] if r else "open")
-
-def set_shop_status(v):
-    c = db(); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('shop_status',?)", (v,))
-    c.commit(); c.close()
 
 def refresh_shop_status():
     c = db()
@@ -154,9 +149,8 @@ def set_user_number(uid, num):
     c = db(); c.execute("INSERT OR REPLACE INTO user_numbers(user_id,number) VALUES(?,?)", (uid, num))
     c.commit(); c.close()
 
-# ---------- Telethon clients per stock ----------
-clients = {}   # sid -> TelegramClient
-waiters = {}   # sid -> asyncio.Future
+clients = {}
+waiters = {}
 
 async def load_client(sid):
     s = get_stock(sid)
@@ -173,17 +167,17 @@ async def load_client(sid):
         if fut and not fut.done():
             fut.set_result(code)
         else:
-            owner = get_stock(sid)
-            if owner and owner["owner_id"]:
+            s2 = get_stock(sid)
+            if s2 and s2["owner_id"]:
                 try:
-                    await app.bot.send_message(owner["owner_id"],
-                        f"📩 Account #{sid} OTP: {code}")
+                    await app.bot.send_message(s2["owner_id"], f"📩 Account #{sid} OTP: {code}")
                 except: pass
 
     clients[sid] = client
     return client
 
-# ---------- Handlers ----------
+app = None
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_blocked(update.effective_user.id):
         return await update.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
@@ -192,7 +186,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("📦 My Accounts", callback_data="myacc"),
     ]])
     await update.message.reply_text(
-        "স্বাগতম।\n/buy — stock দেখো\n/myaccounts — নিজের account\n/setnumber <number> — নম্বর দাও",
+        "স্বাগতম।\n/buy — stock\n/myaccounts — নিজের account\n/setnumber <number> — নম্বর দাও",
         reply_markup=kb)
 
 async def buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +195,7 @@ async def buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
     if shop_status() == "closed":
         await update.message.reply_text("❌ Stock Out — দোকান বন্ধ। পরে আসো।")
-        try: await ctx.bot.send_message(ADMIN_ID, "⚠️ Stock Out! সব account বিক্রি হয়ে গেছে।")
+        try: await ctx.bot.send_message(ADMIN_ID, "⚠️ Stock Out!")
         except: pass
         return
     rows = available_stock()
@@ -225,9 +219,8 @@ async def myaccounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("📩 Get Code", callback_data=f"code:{r['id']}")
         ]])
-        exp = r["expires_at"] or "n/a"
         await update.message.reply_text(
-            f"🆔 Account #{r['id']}\nকেনা: {r['bought_at']}\nমেয়াদ: {exp}\nItem: {r['item'][:60]}...",
+            f"🆔 Account #{r['id']}\nকেনা: {r['bought_at']}\nমেয়াদ: {r['expires_at'] or 'n/a'}\nItem: {r['item'][:60]}...",
             reply_markup=kb)
 
 async def set_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -239,15 +232,13 @@ async def set_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def addstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if len(ctx.args) < 2:
-        return await update.message.reply_text(
-            "ব্যবহার: /addstock <price> <item> [session_string] [phone]")
-    price = int(ctx.args[0])
-    item = ctx.args[1]
+        return await update.message.reply_text("ব্যবহার: /addstock <price> <item> [session] [phone]")
+    price = int(ctx.args[0]); item = ctx.args[1]
     session = ctx.args[2] if len(ctx.args) > 2 else None
     phone = ctx.args[3] if len(ctx.args) > 3 else None
     add_stock(item, price, session, phone)
     n = refresh_shop_status()
-    await update.message.reply_text(f"✅ Stock যোগ হয়েছে। মোট available: {n}")
+    await update.message.reply_text(f"✅ Stock যোগ হয়েছে। Available: {n}")
 
 async def stockout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -256,13 +247,10 @@ async def stockout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    data = q.data
-    uid = q.from_user.id
+    data = q.data; uid = q.from_user.id
 
-    # ---------- user side ----------
     if data == "stock":
         return await buy(q, ctx)
-
     if data == "myacc":
         return await myaccounts(q, ctx)
 
@@ -281,39 +269,35 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_kb)
         try:
             with open(QR_IMAGE, "rb") as f:
-                await q.message.reply_photo(
-                    f,
-                    caption=f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\nপেমেন্ট হলে admin approve করবে।")
+                await q.message.reply_photo(f,
+                    caption=f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\nadmin approve করবে।")
         except FileNotFoundError:
-            await q.message.reply_text(
-                f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\n(QR ফাইল পাওয়া যায়নি)")
+            await q.message.reply_text(f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\n(QR পাওয়া যায়নি)")
         return
 
     if data.startswith("code:"):
         sid = int(data.split(":")[1])
         return await handle_get_code(q, ctx, sid)
 
-    # ---------- admin side ----------
     if uid != ADMIN_ID: return
 
     if data.startswith("acc:"):
         oid = int(data.split(":")[1])
         res = accept_order(oid)
         if not res:
-            return await q.edit_message_text(f"অর্ডার #{oid} accept করা যায়নি (stock শেষ/already processed)।")
+            return await q.edit_message_text(f"অর্ডার #{oid} accept করা যায়নি।")
         s, target_uid = res
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("📩 Get Code", callback_data=f"code:{s['id']}")
         ]])
         try:
             await ctx.bot.send_message(target_uid,
-                f"✅ অর্ডার #{oid} accepted।\n\nAccount #{s['id']}\n"
-                f"মেয়াদ: ৩ দিন\n\nনম্বর: /setnumber <number> দিয়ে নম্বর দাও।\n"
-                f"OTP পেতে Get Code চাপো।",
+                f"✅ অর্ডার #{oid} accepted।\n\nAccount #{s['id']}\nমেয়াদ: ৩ দিন\n\n"
+                f"/setnumber <number> দিয়ে নম্বর দাও। OTP পেতে Get Code চাপো।",
                 reply_markup=kb)
         except Exception as e:
-            log.warning(f"notify user failed: {e}")
-        await q.edit_message_text(f"অর্ডার #{oid} accepted। Account #{s['id']} → user {target_uid}")
+            log.warning(f"notify failed: {e}")
+        await q.edit_message_text(f"অর্ডার #{oid} accepted। Account #{s['id']} → {target_uid}")
 
     elif data.startswith("rej:"):
         oid = int(data.split(":")[1])
@@ -335,18 +319,12 @@ async def handle_get_code(q, ctx: ContextTypes.DEFAULT_TYPE, sid: int):
         return await q.message.reply_text("এটা তোমার account নয়।")
     if not s["session_string"]:
         return await q.message.reply_text("এই account-এর session নেই। admin-কে জানাও।")
-
     client = await load_client(sid)
     if not client:
         return await q.message.reply_text("Session load হয়নি।")
-
-    # Telegram-এ login code trigger (phone থাকলে)
     if s["phone"]:
-        try:
-            await client.send_code_request(s["phone"])
-        except Exception as e:
-            log.warning(f"send_code_request failed: {e}")
-
+        try: await client.send_code_request(s["phone"])
+        except Exception as e: log.warning(f"send_code_request failed: {e}")
     fut = asyncio.get_event_loop().create_future()
     waiters[sid] = fut
     msg = await q.message.reply_text("⏳ ৫ মিনিট OTP-র অপেক্ষা...")
@@ -358,7 +336,6 @@ async def handle_get_code(q, ctx: ContextTypes.DEFAULT_TYPE, sid: int):
     finally:
         waiters.pop(sid, None)
 
-# ---------- Expiry job ----------
 async def expiry_job(ctx: ContextTypes.DEFAULT_TYPE):
     c = db()
     rows = c.execute(
@@ -376,15 +353,11 @@ async def expiry_job(ctx: ContextTypes.DEFAULT_TYPE):
             try: await ctx.bot.send_message(owner, f"⏰ Account #{sid}-এর ৩ দিন শেষ। logout হয়েছে।")
             except: pass
         c = db(); c.execute("UPDATE stock SET sold=2 WHERE id=?", (sid,)); c.commit(); c.close()
-        log.info(f"expired account {sid}")
-
-# ---------- Main ----------
-app = None
+        log.info(f"expired {sid}")
 
 def main():
     global app
-    init_db()
-    refresh_shop_status()
+    init_db(); refresh_shop_status()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
