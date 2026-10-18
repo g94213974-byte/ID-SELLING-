@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: shopbot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: UPI_ID
+        sync: false
+      - key: QR_IMAGE
+        value: qr.png
+      - key: DB_PATH
+        value: /var/data/shop.db
+    disk:
+      name: shopdata
+      mountPath: /var/data
+      sizeGB: 1
