@@ -1,0 +1,402 @@
+# file: bot.py
+# Python 3.11+ | python-telegram-bot v20 | telethon | sqlite3
+# Render + GitHub deploy ready
+# env vars: BOT_TOKEN, ADMIN_ID, API_ID, API_HASH, UPI_ID, QR_IMAGE (optional)
+
+import os, re, asyncio, sqlite3, logging
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
+)
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+
+# ---------- Config ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID  = int(os.getenv("ADMIN_ID", "0"))
+API_ID    = int(os.getenv("API_ID", "0"))
+API_HASH  = os.getenv("API_HASH", "")
+UPI_ID    = os.getenv("UPI_ID", "yourupi@fam")
+QR_IMAGE  = os.getenv("QR_IMAGE", "qr.png")
+DB_PATH   = os.getenv("DB_PATH", "shop.db")
+WAIT_SECONDS = 300  # 5 min
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("shopbot")
+
+OTP_RE = re.compile(r"(?:Login code|code|OTP)[:\s]+(\d{4,6})", re.IGNORECASE)
+
+def extract_otp(text: str):
+    m = OTP_RE.search(text or "")
+    return m.group(1) if m else None
+
+# ---------- DB ----------
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
+
+def init_db():
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS stock(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        session_string TEXT,
+        phone TEXT,
+        sold INTEGER DEFAULT 0,
+        owner_id INTEGER,
+        expires_at DATETIME
+    );
+    CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, item_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, stock_id INTEGER,
+        bought_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS blocked(user_id INTEGER PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS user_numbers(user_id INTEGER PRIMARY KEY, number TEXT);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    """)
+    c.commit(); c.close()
+
+def is_blocked(uid):
+    c = db(); r = c.execute("SELECT 1 FROM blocked WHERE user_id=?", (uid,)).fetchone()
+    c.close(); return r is not None
+
+def shop_status():
+    c = db(); r = c.execute("SELECT value FROM settings WHERE key='shop_status'").fetchone()
+    c.close(); return (r["value"] if r else "open")
+
+def set_shop_status(v):
+    c = db(); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('shop_status',?)", (v,))
+    c.commit(); c.close()
+
+def refresh_shop_status():
+    c = db()
+    n = c.execute("SELECT COUNT(*) FROM stock WHERE sold=0").fetchone()[0]
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('shop_status',?)",
+              ("open" if n > 0 else "closed",))
+    c.commit(); c.close()
+    return n
+
+def add_stock(item, price, session_string=None, phone=None):
+    c = db()
+    c.execute("INSERT INTO stock(item,price,session_string,phone) VALUES(?,?,?,?)",
+              (item, price, session_string, phone))
+    c.commit(); c.close()
+    refresh_shop_status()
+
+def available_stock():
+    c = db(); r = c.execute("SELECT * FROM stock WHERE sold=0").fetchall()
+    c.close(); return r
+
+def create_order(uid, item_id):
+    c = db(); cur = c.execute("INSERT INTO orders(user_id,item_id) VALUES(?,?)", (uid, item_id))
+    oid = cur.lastrowid; c.commit(); c.close(); return oid
+
+def accept_order(oid):
+    c = db()
+    o = c.execute("SELECT * FROM orders WHERE id=? AND status='pending'", (oid,)).fetchone()
+    if not o: c.close(); return None
+    cur = c.execute(
+        "UPDATE stock SET sold=1, owner_id=?, expires_at=datetime('now','+3 days') "
+        "WHERE id=? AND sold=0",
+        (o["user_id"], o["item_id"]))
+    if cur.rowcount == 0:
+        c.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
+        c.commit(); c.close(); return None
+    c.execute("UPDATE orders SET status='accepted' WHERE id=?", (oid,))
+    c.execute("INSERT INTO history(user_id,stock_id) VALUES(?,?)", (o["user_id"], o["item_id"]))
+    s = c.execute("SELECT * FROM stock WHERE id=?", (o["item_id"],)).fetchone()
+    c.commit(); c.close()
+    refresh_shop_status()
+    return s, o["user_id"]
+
+def reject_order(oid):
+    c = db()
+    o = c.execute("SELECT user_id FROM orders WHERE id=?", (oid,)).fetchone()
+    c.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
+    c.commit(); c.close()
+    return o["user_id"] if o else None
+
+def block_user(uid):
+    c = db(); c.execute("INSERT OR IGNORE INTO blocked VALUES(?)", (uid,))
+    c.commit(); c.close()
+
+def user_history(uid):
+    c = db()
+    r = c.execute("""
+        SELECT s.id, s.item, s.expires_at, h.bought_at
+        FROM history h JOIN stock s ON s.id=h.stock_id
+        WHERE h.user_id=? ORDER BY h.id DESC
+    """, (uid,)).fetchall()
+    c.close(); return r
+
+def get_stock(sid):
+    c = db(); r = c.execute("SELECT * FROM stock WHERE id=?", (sid,)).fetchone()
+    c.close(); return r
+
+def get_user_number(uid):
+    c = db(); r = c.execute("SELECT number FROM user_numbers WHERE user_id=?", (uid,)).fetchone()
+    c.close(); return r["number"] if r else None
+
+def set_user_number(uid, num):
+    c = db(); c.execute("INSERT OR REPLACE INTO user_numbers(user_id,number) VALUES(?,?)", (uid, num))
+    c.commit(); c.close()
+
+# ---------- Telethon clients per stock ----------
+clients = {}   # sid -> TelegramClient
+waiters = {}   # sid -> asyncio.Future
+
+async def load_client(sid):
+    s = get_stock(sid)
+    if not s or not s["session_string"]: return None
+    if sid in clients: return clients[sid]
+    client = TelegramClient(StringSession(s["session_string"]), API_ID, API_HASH)
+    await client.connect()
+
+    @client.on(events.NewMessage(incoming=True))
+    async def on_msg(event, sid=sid):
+        code = extract_otp(event.raw_text)
+        if not code: return
+        fut = waiters.get(sid)
+        if fut and not fut.done():
+            fut.set_result(code)
+        else:
+            owner = get_stock(sid)
+            if owner and owner["owner_id"]:
+                try:
+                    await app.bot.send_message(owner["owner_id"],
+                        f"📩 Account #{sid} OTP: {code}")
+                except: pass
+
+    clients[sid] = client
+    return client
+
+# ---------- Handlers ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_blocked(update.effective_user.id):
+        return await update.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛒 Stock", callback_data="stock"),
+        InlineKeyboardButton("📦 My Accounts", callback_data="myacc"),
+    ]])
+    await update.message.reply_text(
+        "স্বাগতম।\n/buy — stock দেখো\n/myaccounts — নিজের account\n/setnumber <number> — নম্বর দাও",
+        reply_markup=kb)
+
+async def buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_blocked(uid):
+        return await update.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
+    if shop_status() == "closed":
+        await update.message.reply_text("❌ Stock Out — দোকান বন্ধ। পরে আসো।")
+        try: await ctx.bot.send_message(ADMIN_ID, "⚠️ Stock Out! সব account বিক্রি হয়ে গেছে।")
+        except: pass
+        return
+    rows = available_stock()
+    if not rows:
+        await update.message.reply_text("❌ Stock Out।")
+        try: await ctx.bot.send_message(ADMIN_ID, "⚠️ Stock Out!")
+        except: pass
+        return
+    kb = [[InlineKeyboardButton(f"#{r['id']} — ₹{r['price']}", callback_data=f"order:{r['id']}")]
+          for r in rows]
+    await update.message.reply_text("Stock:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def myaccounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_blocked(uid):
+        return await update.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
+    rows = user_history(uid)
+    if not rows:
+        return await update.message.reply_text("তুমি এখনো কোনো account কেনো নি।")
+    for r in rows:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📩 Get Code", callback_data=f"code:{r['id']}")
+        ]])
+        exp = r["expires_at"] or "n/a"
+        await update.message.reply_text(
+            f"🆔 Account #{r['id']}\nকেনা: {r['bought_at']}\nমেয়াদ: {exp}\nItem: {r['item'][:60]}...",
+            reply_markup=kb)
+
+async def set_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 1:
+        return await update.message.reply_text("ব্যবহার: /setnumber <number>")
+    set_user_number(update.effective_user.id, ctx.args[0])
+    await update.message.reply_text("✅ নম্বর সেভ হয়েছে।")
+
+async def addstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    if len(ctx.args) < 2:
+        return await update.message.reply_text(
+            "ব্যবহার: /addstock <price> <item> [session_string] [phone]")
+    price = int(ctx.args[0])
+    item = ctx.args[1]
+    session = ctx.args[2] if len(ctx.args) > 2 else None
+    phone = ctx.args[3] if len(ctx.args) > 3 else None
+    add_stock(item, price, session, phone)
+    n = refresh_shop_status()
+    await update.message.reply_text(f"✅ Stock যোগ হয়েছে। মোট available: {n}")
+
+async def stockout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    n = refresh_shop_status()
+    await update.message.reply_text(f"Available: {n} | Status: {shop_status()}")
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data
+    uid = q.from_user.id
+
+    # ---------- user side ----------
+    if data == "stock":
+        return await buy(q, ctx)
+
+    if data == "myacc":
+        return await myaccounts(q, ctx)
+
+    if data.startswith("order:"):
+        item_id = int(data.split(":")[1])
+        if is_blocked(uid):
+            return await q.message.reply_text("তোমাকে ব্লক করা হয়েছে।")
+        oid = create_order(uid, item_id)
+        admin_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Accept", callback_data=f"acc:{oid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"rej:{oid}"),
+            InlineKeyboardButton("🚫 Block", callback_data=f"blk:{uid}"),
+        ]])
+        await ctx.bot.send_message(ADMIN_ID,
+            f"নতুন অর্ডার #{oid}\nUser: {uid} ({q.from_user.full_name})\nItem: {item_id}",
+            reply_markup=admin_kb)
+        try:
+            with open(QR_IMAGE, "rb") as f:
+                await q.message.reply_photo(
+                    f,
+                    caption=f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\nপেমেন্ট হলে admin approve করবে।")
+        except FileNotFoundError:
+            await q.message.reply_text(
+                f"অর্ডার #{oid}\n{UPI_ID}-তে টাকা পাঠাও\n(QR ফাইল পাওয়া যায়নি)")
+        return
+
+    if data.startswith("code:"):
+        sid = int(data.split(":")[1])
+        return await handle_get_code(q, ctx, sid)
+
+    # ---------- admin side ----------
+    if uid != ADMIN_ID: return
+
+    if data.startswith("acc:"):
+        oid = int(data.split(":")[1])
+        res = accept_order(oid)
+        if not res:
+            return await q.edit_message_text(f"অর্ডার #{oid} accept করা যায়নি (stock শেষ/already processed)।")
+        s, target_uid = res
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📩 Get Code", callback_data=f"code:{s['id']}")
+        ]])
+        try:
+            await ctx.bot.send_message(target_uid,
+                f"✅ অর্ডার #{oid} accepted।\n\nAccount #{s['id']}\n"
+                f"মেয়াদ: ৩ দিন\n\nনম্বর: /setnumber <number> দিয়ে নম্বর দাও।\n"
+                f"OTP পেতে Get Code চাপো।",
+                reply_markup=kb)
+        except Exception as e:
+            log.warning(f"notify user failed: {e}")
+        await q.edit_message_text(f"অর্ডার #{oid} accepted। Account #{s['id']} → user {target_uid}")
+
+    elif data.startswith("rej:"):
+        oid = int(data.split(":")[1])
+        target = reject_order(oid)
+        if target:
+            try: await ctx.bot.send_message(target, f"❌ অর্ডার #{oid} reject হয়েছে।")
+            except: pass
+        await q.edit_message_text(f"অর্ডার #{oid} rejected।")
+
+    elif data.startswith("blk:"):
+        target = int(data.split(":")[1])
+        block_user(target)
+        await q.edit_message_text(f"User {target} blocked।")
+
+async def handle_get_code(q, ctx: ContextTypes.DEFAULT_TYPE, sid: int):
+    uid = q.from_user.id
+    s = get_stock(sid)
+    if not s or s["owner_id"] != uid:
+        return await q.message.reply_text("এটা তোমার account নয়।")
+    if not s["session_string"]:
+        return await q.message.reply_text("এই account-এর session নেই। admin-কে জানাও।")
+
+    client = await load_client(sid)
+    if not client:
+        return await q.message.reply_text("Session load হয়নি।")
+
+    # Telegram-এ login code trigger (phone থাকলে)
+    if s["phone"]:
+        try:
+            await client.send_code_request(s["phone"])
+        except Exception as e:
+            log.warning(f"send_code_request failed: {e}")
+
+    fut = asyncio.get_event_loop().create_future()
+    waiters[sid] = fut
+    msg = await q.message.reply_text("⏳ ৫ মিনিট OTP-র অপেক্ষা...")
+    try:
+        code = await asyncio.wait_for(fut, timeout=WAIT_SECONDS)
+        await msg.edit_text(f"✅ OTP:\n{code}\n\nকাউকে দিও না।")
+    except asyncio.TimeoutError:
+        await msg.edit_text("❌ Code not received (৫ মিনিটে কোনো code আসেনি)।")
+    finally:
+        waiters.pop(sid, None)
+
+# ---------- Expiry job ----------
+async def expiry_job(ctx: ContextTypes.DEFAULT_TYPE):
+    c = db()
+    rows = c.execute(
+        "SELECT id, owner_id FROM stock WHERE sold=1 AND expires_at IS NOT NULL AND expires_at <= datetime('now')"
+    ).fetchall()
+    c.close()
+    for r in rows:
+        sid = r["id"]; owner = r["owner_id"]
+        client = clients.get(sid)
+        if client:
+            try: await client.log_out()
+            except: pass
+            clients.pop(sid, None)
+        if owner:
+            try: await ctx.bot.send_message(owner, f"⏰ Account #{sid}-এর ৩ দিন শেষ। logout হয়েছে।")
+            except: pass
+        c = db(); c.execute("UPDATE stock SET sold=2 WHERE id=?", (sid,)); c.commit(); c.close()
+        log.info(f"expired account {sid}")
+
+# ---------- Main ----------
+app = None
+
+def main():
+    global app
+    init_db()
+    refresh_shop_status()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("myaccounts", myaccounts))
+    app.add_handler(CommandHandler("setnumber", set_number))
+    app.add_handler(CommandHandler("addstock", addstock))
+    app.add_handler(CommandHandler("stockout", stockout_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    if app.job_queue:
+        app.job_queue.run_repeating(expiry_job, interval=1800, first=60)
+    log.info("bot starting")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
